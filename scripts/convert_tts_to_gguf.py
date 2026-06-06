@@ -12,8 +12,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import logging
+import os
 import re
 import sys
 from pathlib import Path
@@ -36,6 +38,63 @@ import gguf
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+
+QK_K = 256
+K_QUANT_ROW_SIZES = {
+    "q4_k": 144,
+    "q5_k_m": 176,
+    "q6_k": 210,
+}
+
+
+class KQuantHelper:
+    def __init__(self) -> None:
+        env_lib_path = os.environ.get("QWEN3_KQUANT_LIB")
+        if env_lib_path is not None:
+            lib_path = Path(env_lib_path)
+        else:
+            lib_ext = "dylib" if sys.platform == "darwin" else "so"
+            lib_path = Path(__file__).resolve().parent / f"libqwen3_kquant.{lib_ext}"
+        if not lib_path.exists():
+            raise RuntimeError(
+                f"K-quant helper library not found: {lib_path}. "
+                "Run scripts/build_kquant_helper.sh or set QWEN3_KQUANT_LIB."
+            )
+        self.lib = ctypes.CDLL(str(lib_path))
+        for name in ["qwen3_quantize_q4_k", "qwen3_quantize_q5_k", "qwen3_quantize_q6_k"]:
+            fn = getattr(self.lib, name)
+            fn.argtypes = [
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_void_p,
+                ctypes.c_int64,
+                ctypes.c_int64,
+            ]
+            fn.restype = ctypes.c_size_t
+
+    def quantize(self, data: np.ndarray, output_type: str) -> np.ndarray:
+        if data.ndim != 2:
+            raise ValueError(f"K-quants require a 2D tensor, got shape {data.shape}")
+        rows, cols = data.shape
+        if cols % QK_K != 0:
+            raise ValueError(f"K-quants require row size divisible by {QK_K}, got {cols}")
+        data = np.ascontiguousarray(data, dtype=np.float32)
+        row_size = K_QUANT_ROW_SIZES[output_type]
+        output = np.empty((rows, (cols // QK_K) * row_size), dtype=np.uint8)
+        fn_name = {
+            "q4_k": "qwen3_quantize_q4_k",
+            "q5_k_m": "qwen3_quantize_q5_k",
+            "q6_k": "qwen3_quantize_q6_k",
+        }[output_type]
+        written = getattr(self.lib, fn_name)(
+            data.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            output.ctypes.data_as(ctypes.c_void_p),
+            rows,
+            cols,
+        )
+        if written != output.size:
+            raise RuntimeError(f"K-quant wrote {written} bytes, expected {output.size}")
+        return output
 
 
 class Qwen3TTSConverter:
@@ -140,6 +199,7 @@ class Qwen3TTSConverter:
 
         # Extract model parameters
         self._extract_params()
+        self.k_quant_helper = KQuantHelper() if output_type in {"q4_k", "q5_k_m", "q6_k"} else None
 
     def _load_config(self) -> dict[str, Any]:
         """Load model configuration from config.json."""
@@ -303,17 +363,35 @@ class Qwen3TTSConverter:
             except Exception as e:
                 logger.warning(f"Q8_0 quantization failed for {tensor_name}: {e}, falling back to F16")
                 return data.astype(np.float16), gguf.GGMLQuantizationType.F16
-        elif self.output_type == "q4_k":
+        elif self.output_type == "q4_0":
             if not self._should_quantize(tensor_name):
                 logger.debug(f"Keeping {tensor_name} in F16 (not quantizing)")
                 return data.astype(np.float16), gguf.GGMLQuantizationType.F16
             
             data = data.astype(np.float32)
             try:
-                quantized = gguf.quants.quantize(data, gguf.GGMLQuantizationType.Q4_K)
-                return quantized, gguf.GGMLQuantizationType.Q4_K
+                quantized = gguf.quants.quantize(data, gguf.GGMLQuantizationType.Q4_0)
+                return quantized, gguf.GGMLQuantizationType.Q4_0
             except Exception as e:
-                logger.warning(f"Q4_K quantization failed for {tensor_name}: {e}, falling back to F16")
+                logger.warning(f"Q4_0 quantization failed for {tensor_name}: {e}, falling back to F16")
+                return data.astype(np.float16), gguf.GGMLQuantizationType.F16
+        elif self.output_type in {"q4_k", "q5_k_m", "q6_k"}:
+            if not self._should_quantize(tensor_name):
+                logger.debug(f"Keeping {tensor_name} in F16 (not quantizing)")
+                return data.astype(np.float16), gguf.GGMLQuantizationType.F16
+
+            try:
+                if self.k_quant_helper is None:
+                    raise RuntimeError("K-quant helper was not initialized")
+                quantized = self.k_quant_helper.quantize(data, self.output_type)
+                dtype = {
+                    "q4_k": gguf.GGMLQuantizationType.Q4_K,
+                    "q5_k_m": gguf.GGMLQuantizationType.Q5_K,
+                    "q6_k": gguf.GGMLQuantizationType.Q6_K,
+                }[self.output_type]
+                return quantized, dtype
+            except Exception as e:
+                logger.warning(f"{self.output_type.upper()} quantization failed for {tensor_name}: {e}, falling back to F16")
                 return data.astype(np.float16), gguf.GGMLQuantizationType.F16
         else:
             return data.astype(np.float16), gguf.GGMLQuantizationType.F16
@@ -542,9 +620,9 @@ def main():
     )
     parser.add_argument(
         "--type", "-t",
-        choices=["f16", "f32", "q8_0", "q4_k"],
+        choices=["f16", "f32", "q8_0", "q4_0", "q4_k", "q5_k_m", "q6_k"],
         default="f16",
-        help="Output data type (default: f16). q8_0 provides ~50%% size reduction, q4_k provides ~70%% size reduction."
+        help="Output data type (default: f16). q8_0 provides ~50%% size reduction; q4_0/q4_k/q5_k_m/q6_k require supported quantization."
     )
     parser.add_argument(
         "--verbose", "-v",
