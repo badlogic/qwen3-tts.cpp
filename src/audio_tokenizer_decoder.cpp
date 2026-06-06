@@ -2,14 +2,104 @@
 #include "gguf_loader.h"
 #include "ggml-cpu.h"
 
-#include <cmath>
-#include <cstring>
 #include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <map>
 #include <numeric>
+#include <string>
 
 #define QWEN3_TTS_DEC_MAX_NODES 32768
 
 namespace qwen3_tts {
+
+namespace {
+
+bool decoder_profile_enabled() {
+    const char * value = std::getenv("QWEN3_TTS_PROFILE_DECODER");
+    return value && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+const char * backend_name_or_null(ggml_backend_t backend) {
+    return backend ? ggml_backend_name(backend) : "NULL";
+}
+
+void print_decoder_graph_support(struct ggml_cgraph * gf, ggml_backend_t preferred_backend) {
+    if (!decoder_profile_enabled()) return;
+
+    ggml_backend_dev_t preferred_device = preferred_backend ? ggml_backend_get_device(preferred_backend) : nullptr;
+    const char * preferred_name = preferred_device ? ggml_backend_dev_name(preferred_device) : "NULL";
+    int supported = 0;
+    std::map<std::string, int> unsupported_ops;
+
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    for (int i = 0; i < n_nodes; ++i) {
+        struct ggml_tensor * node = ggml_graph_node(gf, i);
+        if (preferred_device && ggml_backend_dev_supports_op(preferred_device, node)) {
+            supported++;
+        } else {
+            unsupported_ops[ggml_op_name(node->op)]++;
+        }
+    }
+
+    fprintf(stderr, "Decoder preferred backend %s supports %d/%d nodes\n",
+            preferred_name, supported, n_nodes);
+    if (!unsupported_ops.empty()) {
+        fprintf(stderr, "Decoder unsupported ops on %s:\n", preferred_name);
+        for (const auto & entry : unsupported_ops) {
+            fprintf(stderr, "  %-24s %5d\n", entry.first.c_str(), entry.second);
+        }
+    }
+}
+
+void print_decoder_assignment(struct ggml_cgraph * gf, ggml_backend_sched_t sched) {
+    if (!decoder_profile_enabled()) return;
+
+    std::map<std::string, int> backend_counts;
+    std::map<std::string, int> op_backend_counts;
+
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    for (int i = 0; i < n_nodes; ++i) {
+        struct ggml_tensor * node = ggml_graph_node(gf, i);
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, node);
+        std::string backend_name = backend_name_or_null(backend);
+        std::string key = backend_name + ":" + ggml_op_name(node->op);
+        backend_counts[backend_name]++;
+        op_backend_counts[key]++;
+    }
+
+    fprintf(stderr, "Decoder backend assignment summary (%d nodes):\n", n_nodes);
+    for (const auto & entry : backend_counts) {
+        fprintf(stderr, "  %-12s %5d nodes\n", entry.first.c_str(), entry.second);
+    }
+    fprintf(stderr, "Decoder op/backend counts:\n");
+    for (const auto & entry : op_backend_counts) {
+        fprintf(stderr, "  %-32s %5d\n", entry.first.c_str(), entry.second);
+    }
+}
+
+void print_decoder_buffer_info(const audio_decoder_model & model) {
+    if (!decoder_profile_enabled()) return;
+
+    if (!model.buffer) {
+        fprintf(stderr, "Decoder model buffer: NULL\n");
+        return;
+    }
+
+    fprintf(stderr, "Decoder model buffer: %s usage=%d size=%zu\n",
+            ggml_backend_buffer_name(model.buffer),
+            (int)ggml_backend_buffer_get_usage(model.buffer),
+            ggml_backend_buffer_get_size(model.buffer));
+}
+
+} // namespace
 
 AudioTokenizerDecoder::AudioTokenizerDecoder() = default;
 
@@ -328,6 +418,7 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
     }
     
     normalize_codebooks();
+    print_decoder_buffer_info(model_);
     // Codebooks are normalized in host memory; sync once to backend tensors.
     auto upload_if_present = [](struct ggml_tensor * t) {
         if (t && t->data) {
@@ -817,13 +908,21 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
         }
     }
     
+    int64_t t_build_start = now_ms();
     struct ggml_cgraph * gf = build_graph(n_frames);
-    
+    int64_t t_build_ms = now_ms() - t_build_start;
+
+    print_decoder_graph_support(gf, state_.backend);
+
+    int64_t t_alloc_start = now_ms();
     if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
         error_msg_ = "Failed to allocate graph";
         return false;
     }
+    int64_t t_alloc_ms = now_ms() - t_alloc_start;
+    print_decoder_assignment(gf, state_.sched);
     
+    int64_t t_set_start = now_ms();
     std::vector<int32_t> cb_codes(n_frames);
     for (int cb = 0; cb < 16; ++cb) {
         char name[32];
@@ -855,12 +954,14 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
     }
     
 
-    
+    int64_t t_set_ms = now_ms() - t_set_start;
+    int64_t t_compute_start = now_ms();
     if (ggml_backend_sched_graph_compute(state_.sched, gf) != GGML_STATUS_SUCCESS) {
         error_msg_ = "Failed to compute graph";
         ggml_backend_sched_reset(state_.sched);
         return false;
     }
+    int64_t t_compute_ms = now_ms() - t_compute_start;
     
     struct ggml_tensor * audio_tensor = ggml_graph_get_tensor(gf, "audio");
     if (!audio_tensor) {
@@ -869,9 +970,23 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
         return false;
     }
     
+    int64_t t_get_start = now_ms();
     int64_t n_samples = audio_tensor->ne[0];
     samples.resize(n_samples);
     ggml_backend_tensor_get(audio_tensor, samples.data(), 0, n_samples * sizeof(float));
+    int64_t t_get_ms = now_ms() - t_get_start;
+
+    if (decoder_profile_enabled()) {
+        fprintf(stderr,
+                "Decoder profile: frames=%d samples=%lld build=%lld ms alloc=%lld ms set=%lld ms compute=%lld ms get=%lld ms\n",
+                n_frames,
+                (long long)n_samples,
+                (long long)t_build_ms,
+                (long long)t_alloc_ms,
+                (long long)t_set_ms,
+                (long long)t_compute_ms,
+                (long long)t_get_ms);
+    }
     
     ggml_backend_sched_reset(state_.sched);
     

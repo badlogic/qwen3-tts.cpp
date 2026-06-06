@@ -1,7 +1,10 @@
 #include "qwen3_tts.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <string>
 
 void print_usage(const char * program) {
@@ -9,7 +12,8 @@ void print_usage(const char * program) {
     fprintf(stderr, "\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -m, --model <dir>      Model directory (required)\n");
-    fprintf(stderr, "  -t, --text <text>      Text to synthesize (required)\n");
+    fprintf(stderr, "  -t, --text <text>      Text to synthesize\n");
+    fprintf(stderr, "  --text-file <file>     File containing text to synthesize\n");
     fprintf(stderr, "  -o, --output <file>    Output WAV file (default: output.wav)\n");
     fprintf(stderr, "  -r, --reference <file> Reference audio for voice cloning\n");
     fprintf(stderr, "  --temperature <val>    Sampling temperature (default: 0.9, 0=greedy)\n");
@@ -19,6 +23,7 @@ void print_usage(const char * program) {
     fprintf(stderr, "  --repetition-penalty <val> Repetition penalty (default: 1.05)\n");
     fprintf(stderr, "  -l, --language <lang>  Language: en,ru,zh,ja,ko,de,fr,es (default: en)\n");
     fprintf(stderr, "  -j, --threads <n>      Number of threads (default: 4)\n");
+    fprintf(stderr, "  --json-timing          Emit one machine-readable timing JSON line to stderr\n");
     fprintf(stderr, "  -h, --help             Show this help\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Example:\n");
@@ -26,11 +31,80 @@ void print_usage(const char * program) {
     fprintf(stderr, "  %s -m ./models -t \"Hello!\" -r reference.wav -o cloned.wav\n", program);
 }
 
+static int64_t get_time_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static bool read_text_file(const std::string & path, std::string & out) {
+    std::ifstream file(path);
+    if (!file) return false;
+    out.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+    return true;
+}
+
+static std::string json_escape(const std::string & value) {
+    std::string out;
+    out.reserve(value.size() + 16);
+    for (unsigned char c : value) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += (char)c;
+                }
+                break;
+        }
+    }
+    return out;
+}
+
+static void print_json_timing(const qwen3_tts::tts_result & result,
+                              const std::string & model_dir,
+                              const std::string & output_file,
+                              int64_t load_ms) {
+    const double audio_seconds = result.sample_rate > 0
+        ? (double)result.audio.size() / (double)result.sample_rate : 0.0;
+    const double total_seconds = (double)result.t_total_ms / 1000.0;
+    const double throughput = total_seconds > 0.0 ? audio_seconds / total_seconds : 0.0;
+    fprintf(stderr,
+            "{\"type\":\"timing\",\"backend\":\"ggml_cli\","
+            "\"model\":\"%s\",\"output\":\"%s\","
+            "\"loadMs\":%lld,\"tokenizeMs\":%lld,\"referencePrepMs\":%lld,"
+            "\"generateMs\":%lld,\"decodeMs\":%lld,\"totalMs\":%lld,"
+            "\"audioSeconds\":%.3f,\"throughput\":%.3f,\"sampleRate\":%d,"
+            "\"rssPeakBytes\":%llu,\"physPeakBytes\":%llu}\n",
+            json_escape(model_dir).c_str(), json_escape(output_file).c_str(),
+            (long long)load_ms,
+            (long long)result.t_tokenize_ms,
+            (long long)result.t_encode_ms,
+            (long long)result.t_generate_ms,
+            (long long)result.t_decode_ms,
+            (long long)result.t_total_ms,
+            audio_seconds,
+            throughput,
+            result.sample_rate,
+            (unsigned long long)result.mem_rss_peak_bytes,
+            (unsigned long long)result.mem_phys_peak_bytes);
+}
+
 int main(int argc, char ** argv) {
     std::string model_dir;
     std::string text;
     std::string output_file = "output.wav";
     std::string reference_audio;
+    bool json_timing = false;
     
     qwen3_tts::tts_params params;
     
@@ -53,6 +127,15 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             text = argv[i];
+        } else if (arg == "--text-file") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing text file\n");
+                return 1;
+            }
+            if (!read_text_file(argv[i], text)) {
+                fprintf(stderr, "Error: failed to read text file: %s\n", argv[i]);
+                return 1;
+            }
         } else if (arg == "-o" || arg == "--output") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing output file\n");
@@ -121,6 +204,8 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             params.n_threads = std::stoi(argv[i]);
+        } else if (arg == "--json-timing") {
+            json_timing = true;
         } else {
             fprintf(stderr, "Error: unknown argument: %s\n", arg.c_str());
             print_usage(argv[0]);
@@ -145,10 +230,12 @@ int main(int argc, char ** argv) {
     qwen3_tts::Qwen3TTS tts;
     
     fprintf(stderr, "Loading models from: %s\n", model_dir.c_str());
+    int64_t t_load_start = get_time_ms();
     if (!tts.load_models(model_dir)) {
         fprintf(stderr, "Error: %s\n", tts.get_error().c_str());
         return 1;
     }
+    int64_t load_ms = get_time_ms() - t_load_start;
     
     // Set progress callback
     tts.set_progress_callback([](int tokens, int max_tokens) {
@@ -187,12 +274,16 @@ int main(int argc, char ** argv) {
     // Print timing
     if (params.print_timing) {
         fprintf(stderr, "\nTiming:\n");
-        fprintf(stderr, "  Load:      %6lld ms\n", (long long)result.t_load_ms);
+        fprintf(stderr, "  Load:      %6lld ms\n", (long long)load_ms);
         fprintf(stderr, "  Tokenize:  %6lld ms\n", (long long)result.t_tokenize_ms);
         fprintf(stderr, "  Encode:    %6lld ms\n", (long long)result.t_encode_ms);
         fprintf(stderr, "  Generate:  %6lld ms\n", (long long)result.t_generate_ms);
         fprintf(stderr, "  Decode:    %6lld ms\n", (long long)result.t_decode_ms);
         fprintf(stderr, "  Total:     %6lld ms\n", (long long)result.t_total_ms);
+    }
+
+    if (json_timing) {
+        print_json_timing(result, model_dir, output_file, load_ms);
     }
     
     return 0;
