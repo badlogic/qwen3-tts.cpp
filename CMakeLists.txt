@@ -32,10 +32,18 @@ find_package(Threads REQUIRED)
 
 # GGML library paths
 set(GGML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml")
-set(GGML_BUILD_DIR "${GGML_DIR}/build")
+if(EXISTS "${GGML_DIR}/build-static/src/libggml.a")
+    set(GGML_DEFAULT_BUILD_DIR "${GGML_DIR}/build-static")
+else()
+    set(GGML_DEFAULT_BUILD_DIR "${GGML_DIR}/build")
+endif()
+set(GGML_BUILD_DIR "${GGML_DEFAULT_BUILD_DIR}" CACHE PATH "Path to a configured GGML build directory")
+option(QWEN3_TTS_STATIC_GGML "Link GGML static archives into qwen3-tts binaries" ON)
+option(QWEN3_TTS_BUILD_SHARED_API "Build qwen3tts shared library C API" OFF)
 
 # Detect GGML GPU backends in the separately built ggml tree.
-if(APPLE AND EXISTS "${GGML_BUILD_DIR}/src/ggml-metal/libggml-metal.dylib")
+if(APPLE AND (EXISTS "${GGML_BUILD_DIR}/src/ggml-metal/libggml-metal.dylib"
+        OR EXISTS "${GGML_BUILD_DIR}/src/ggml-metal/libggml-metal.a"))
     set(GGML_HAS_METAL ON)
     message(STATUS "GGML Metal backend found — GPU acceleration enabled")
 else()
@@ -58,21 +66,66 @@ endif()
 
 set(GGML_BACKEND_LINK_DIRS
     ${GGML_BUILD_DIR}/src
-    ${GGML_BUILD_DIR}/src/ggml-metal
-    ${GGML_VULKAN_LIB_DIR}
     ${GGML_BUILD_DIR}/bin
 )
-set(GGML_BACKEND_LIBS
-    ggml
-    ggml-base
-    ggml-cpu
-    Threads::Threads
-)
 if(GGML_HAS_METAL)
-    list(APPEND GGML_BACKEND_LIBS ggml-metal "-framework Metal" "-framework MetalKit")
+    list(APPEND GGML_BACKEND_LINK_DIRS ${GGML_BUILD_DIR}/src/ggml-metal)
 endif()
 if(GGML_HAS_VULKAN)
-    list(APPEND GGML_BACKEND_LIBS ggml-vulkan)
+    list(APPEND GGML_BACKEND_LINK_DIRS ${GGML_VULKAN_LIB_DIR})
+endif()
+if(QWEN3_TTS_STATIC_GGML)
+    foreach(required_ggml_archive
+            ${GGML_BUILD_DIR}/src/libggml.a
+            ${GGML_BUILD_DIR}/src/libggml-cpu.a
+            ${GGML_BUILD_DIR}/src/libggml-base.a)
+        if(NOT EXISTS "${required_ggml_archive}")
+            message(FATAL_ERROR "Static GGML archive not found: ${required_ggml_archive}. Build GGML with -DBUILD_SHARED_LIBS=OFF -DGGML_STATIC=ON or set GGML_BUILD_DIR to a static GGML build.")
+        endif()
+    endforeach()
+    set(GGML_BACKEND_LIBS
+        ${GGML_BUILD_DIR}/src/libggml.a
+        ${GGML_BUILD_DIR}/src/libggml-cpu.a
+    )
+    if(EXISTS "${GGML_BUILD_DIR}/src/ggml-blas/libggml-blas.a")
+        list(APPEND GGML_BACKEND_LIBS
+            ${GGML_BUILD_DIR}/src/ggml-blas/libggml-blas.a
+        )
+        if(APPLE)
+            list(APPEND GGML_BACKEND_LIBS "-framework Accelerate")
+        endif()
+    endif()
+    if(GGML_HAS_METAL)
+        list(APPEND GGML_BACKEND_LIBS
+            ${GGML_BUILD_DIR}/src/ggml-metal/libggml-metal.a
+            "-framework Foundation"
+            "-framework Metal"
+            "-framework MetalKit"
+        )
+    endif()
+    if(GGML_HAS_VULKAN)
+        list(APPEND GGML_BACKEND_LIBS ${GGML_BUILD_DIR}/src/ggml-vulkan/libggml-vulkan.a)
+    endif()
+    list(APPEND GGML_BACKEND_LIBS
+        ${GGML_BUILD_DIR}/src/libggml-base.a
+        Threads::Threads
+    )
+    if(UNIX)
+        list(APPEND GGML_BACKEND_LIBS m)
+    endif()
+else()
+    set(GGML_BACKEND_LIBS
+        ggml
+        ggml-base
+        ggml-cpu
+        Threads::Threads
+    )
+    if(GGML_HAS_METAL)
+        list(APPEND GGML_BACKEND_LIBS ggml-metal "-framework Metal" "-framework MetalKit")
+    endif()
+    if(GGML_HAS_VULKAN)
+        list(APPEND GGML_BACKEND_LIBS ggml-vulkan)
+    endif()
 endif()
 
 function(target_link_ggml_backends target_name)
@@ -157,20 +210,28 @@ target_link_libraries(qwen3_tts PUBLIC
 )
 
 # Shared library with C API (for Nim FFI)
-add_library(qwen3tts_shared SHARED
-    src/qwen3tts_c_api.cpp
-)
-set_target_properties(qwen3tts_shared PROPERTIES
-    OUTPUT_NAME "qwen3tts"
-    VERSION ${PROJECT_VERSION}
-    SOVERSION 0
-)
-target_include_directories(qwen3tts_shared PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
-target_link_libraries(qwen3tts_shared PRIVATE
-    qwen3_tts
-)
+if(QWEN3_TTS_BUILD_SHARED_API)
+    add_library(qwen3tts_shared SHARED
+        src/qwen3tts_c_api.cpp
+    )
+    set_target_properties(qwen3tts_shared PROPERTIES
+        OUTPUT_NAME "qwen3tts"
+        VERSION ${PROJECT_VERSION}
+        SOVERSION 0
+    )
+    target_include_directories(qwen3tts_shared PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(qwen3tts_shared PRIVATE
+        qwen3_tts
+    )
+    if(APPLE)
+        target_link_libraries(qwen3tts_shared PRIVATE
+            "-framework Foundation"
+            objc
+        )
+    endif()
+endif()
 
 # CLI executable
 add_executable(qwen3-tts-cli
@@ -225,7 +286,19 @@ target_link_libraries(test_decoder PRIVATE
 )
 
 # Install targets
-install(TARGETS text_tokenizer tts_transformer audio_tokenizer_encoder audio_tokenizer_decoder qwen3_tts qwen3tts_shared qwen3-tts-cli qwen3-tts-worker
+set(QWEN3_TTS_INSTALL_TARGETS
+    text_tokenizer
+    tts_transformer
+    audio_tokenizer_encoder
+    audio_tokenizer_decoder
+    qwen3_tts
+    qwen3-tts-cli
+    qwen3-tts-worker
+)
+if(QWEN3_TTS_BUILD_SHARED_API)
+    list(APPEND QWEN3_TTS_INSTALL_TARGETS qwen3tts_shared)
+endif()
+install(TARGETS ${QWEN3_TTS_INSTALL_TARGETS}
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION bin
