@@ -29,6 +29,7 @@ endif()
 
 # Find threads
 find_package(Threads REQUIRED)
+find_package(OpenMP)
 
 # GGML library paths
 set(GGML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml")
@@ -104,12 +105,19 @@ if(QWEN3_TTS_STATIC_GGML)
         )
     endif()
     if(GGML_HAS_VULKAN)
-        list(APPEND GGML_BACKEND_LIBS ${GGML_BUILD_DIR}/src/ggml-vulkan/libggml-vulkan.a)
+        find_package(Vulkan REQUIRED)
+        list(APPEND GGML_BACKEND_LIBS
+            ${GGML_BUILD_DIR}/src/ggml-vulkan/libggml-vulkan.a
+            Vulkan::Vulkan
+        )
     endif()
     list(APPEND GGML_BACKEND_LIBS
         ${GGML_BUILD_DIR}/src/libggml-base.a
         Threads::Threads
     )
+    if(OpenMP_CXX_FOUND)
+        list(APPEND GGML_BACKEND_LIBS OpenMP::OpenMP_CXX)
+    endif()
     if(UNIX)
         list(APPEND GGML_BACKEND_LIBS m)
     endif()
