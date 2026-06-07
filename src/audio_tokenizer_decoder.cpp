@@ -10,6 +10,7 @@
 #include <map>
 #include <numeric>
 #include <string>
+#include <vector>
 
 #define QWEN3_TTS_DEC_MAX_NODES 32768
 
@@ -131,26 +132,28 @@ void AudioTokenizerDecoder::normalize_codebooks() {
     const float epsilon = 1e-5f;
     
     auto normalize_codebook = [epsilon](struct ggml_tensor * codebook, struct ggml_tensor * usage, const char *) {
-        if (!codebook || !usage || !codebook->data || !usage->data) return;
+        if (!codebook || !usage) return;
         
-        int64_t codebook_dim = codebook->ne[0];
-        int64_t codebook_size = codebook->ne[1];
+        const int64_t codebook_dim = codebook->ne[0];
+        const int64_t codebook_size = codebook->ne[1];
+        std::vector<ggml_fp16_t> cb_data((size_t)(codebook_dim * codebook_size));
+        std::vector<float> usage_data((size_t)codebook_size);
         
-        ggml_fp16_t * cb_data = (ggml_fp16_t *)codebook->data;
-        float * usage_data = (float *)usage->data;
+        ggml_backend_tensor_get(codebook, cb_data.data(), 0, ggml_nbytes(codebook));
+        ggml_backend_tensor_get(usage, usage_data.data(), 0, ggml_nbytes(usage));
         
         for (int64_t emb_idx = 0; emb_idx < codebook_size; ++emb_idx) {
-            float u = usage_data[emb_idx];
+            float u = usage_data[(size_t)emb_idx];
             if (u < epsilon) u = epsilon;
             float inv_u = 1.0f / u;
             
             for (int64_t dim_idx = 0; dim_idx < codebook_dim; ++dim_idx) {
-                int64_t mem_idx = dim_idx + emb_idx * codebook_dim;
+                const size_t mem_idx = (size_t)(dim_idx + emb_idx * codebook_dim);
                 float val = ggml_fp16_to_fp32(cb_data[mem_idx]);
                 cb_data[mem_idx] = ggml_fp32_to_fp16(val * inv_u);
             }
         }
-        
+        ggml_backend_tensor_set(codebook, cb_data.data(), 0, ggml_nbytes(codebook));
     };
     
     normalize_codebook(model_.vq_first_codebook, model_.vq_first_usage, "first");
@@ -419,16 +422,6 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
     
     normalize_codebooks();
     print_decoder_buffer_info(model_);
-    // Codebooks are normalized in host memory; sync once to backend tensors.
-    auto upload_if_present = [](struct ggml_tensor * t) {
-        if (t && t->data) {
-            ggml_backend_tensor_set(t, t->data, 0, ggml_nbytes(t));
-        }
-    };
-    upload_if_present(model_.vq_first_codebook);
-    for (int i = 0; i < 15; ++i) {
-        upload_if_present(model_.vq_rest_codebook[i]);
-    }
     
     state_.backend = init_preferred_backend("AudioTokenizerDecoder", &error_msg_);
     if (!state_.backend) {
