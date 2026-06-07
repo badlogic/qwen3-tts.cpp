@@ -93,7 +93,61 @@ static void compute_mel_filterbank_slaney(float * filterbank, int n_mels, int n_
     }
 }
 
+static bool is_power_of_two(int n) {
+    return n > 0 && (n & (n - 1)) == 0;
+}
+
+static void compute_fft(const float * input, float * real, float * imag, int n) {
+    for (int i = 0; i < n; ++i) {
+        real[i] = input[i];
+        imag[i] = 0.0f;
+    }
+
+    int j = 0;
+    for (int i = 1; i < n; ++i) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) {
+            j ^= bit;
+        }
+        j ^= bit;
+        if (i < j) {
+            std::swap(real[i], real[j]);
+            std::swap(imag[i], imag[j]);
+        }
+    }
+
+    for (int len = 2; len <= n; len <<= 1) {
+        const float angle = -2.0f * float(M_PI) / float(len);
+        const float wlen_real = cosf(angle);
+        const float wlen_imag = sinf(angle);
+        for (int i = 0; i < n; i += len) {
+            float w_real = 1.0f;
+            float w_imag = 0.0f;
+            const int half = len >> 1;
+            for (int k = 0; k < half; ++k) {
+                const int even = i + k;
+                const int odd = even + half;
+                const float odd_real = real[odd] * w_real - imag[odd] * w_imag;
+                const float odd_imag = real[odd] * w_imag + imag[odd] * w_real;
+                real[odd] = real[even] - odd_real;
+                imag[odd] = imag[even] - odd_imag;
+                real[even] += odd_real;
+                imag[even] += odd_imag;
+
+                const float next_w_real = w_real * wlen_real - w_imag * wlen_imag;
+                w_imag = w_real * wlen_imag + w_imag * wlen_real;
+                w_real = next_w_real;
+            }
+        }
+    }
+}
+
 static void compute_dft(const float * input, float * real, float * imag, int n) {
+    if (is_power_of_two(n)) {
+        compute_fft(input, real, imag, n);
+        return;
+    }
+
     for (int k = 0; k < n; ++k) {
         real[k] = 0.0f;
         imag[k] = 0.0f;
