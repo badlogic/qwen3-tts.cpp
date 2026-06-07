@@ -1,6 +1,7 @@
 #include "gguf_loader.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 
@@ -16,6 +17,14 @@ shared_backend_state & get_shared_backend_state() {
     static shared_backend_state state;
     return state;
 }
+
+void configure_metal_backend_defaults() {
+#ifdef __APPLE__
+    if (!std::getenv("GGML_METAL_TENSOR_DISABLE")) {
+        setenv("GGML_METAL_TENSOR_DISABLE", "1", 0);
+    }
+#endif
+}
 }
 
 GGUFLoader::GGUFLoader() = default;
@@ -25,6 +34,8 @@ GGUFLoader::~GGUFLoader() {
 }
 
 ggml_backend_t init_preferred_backend(const char * component_name, std::string * error_msg) {
+    configure_metal_backend_defaults();
+
     if (error_msg) error_msg->clear();
 
     auto & shared = get_shared_backend_state();
@@ -160,7 +171,18 @@ bool load_tensor_data_from_file(
     std::string & error_msg,
     enum ggml_backend_dev_type preferred_backend_type
 ) {
+    configure_metal_backend_defaults();
+
     ggml_backend_t backend = ggml_backend_init_by_type(preferred_backend_type, nullptr);
+    if (!backend && preferred_backend_type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+        backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
+    }
+    if (!backend && preferred_backend_type != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+    }
+    if (!backend && preferred_backend_type != GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+        backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_ACCEL, nullptr);
+    }
     if (!backend && preferred_backend_type != GGML_BACKEND_DEVICE_TYPE_CPU) {
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     }
