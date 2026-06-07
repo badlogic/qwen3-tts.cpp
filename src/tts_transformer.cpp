@@ -1363,7 +1363,7 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past) {
         
         struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
         KQ = ggml_scale(ctx0, KQ, KQscale);
-        KQ = ggml_diag_mask_inf(ctx0, KQ, n_past);
+        // n_tokens == 1, so there are no future positions to mask.
         KQ = ggml_soft_max(ctx0, KQ);
         
         V = ggml_cont(ctx0, ggml_transpose(ctx0, V));
@@ -1783,7 +1783,7 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t n_past, 
         
         struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
         KQ = ggml_scale(ctx0, KQ, KQscale);
-        KQ = ggml_diag_mask_inf(ctx0, KQ, n_past);
+        // n_tokens == 1, so there are no future positions to mask.
         KQ = ggml_soft_max(ctx0, KQ);
         
         V = ggml_cont(ctx0, ggml_transpose(ctx0, V));
