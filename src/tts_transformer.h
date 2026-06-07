@@ -320,6 +320,10 @@ private:
     // Build computation graph for 2-token prefill of code predictor
     // Processes [past_hidden, codec_embd(codebook_0_token)] together
     struct ggml_cgraph * build_code_pred_prefill_graph();
+
+    struct ggml_tensor * apply_ffn_down(struct ggml_context * ctx0,
+                                        const transformer_layer & layer,
+                                        struct ggml_tensor * cur) const;
     
     // Parse hyperparameters from GGUF
     bool parse_config(struct gguf_context * ctx);
@@ -342,6 +346,7 @@ private:
     bool use_coreml_code_predictor_ = false;
     std::string coreml_code_predictor_path_;
     bool skip_ggml_code_pred_layers_ = false;
+    bool use_vulkan_direct_q8_ffn_down_ = false;
 
 #ifdef QWEN3_TTS_TIMING
     tts_timing * timing_ = nullptr;
