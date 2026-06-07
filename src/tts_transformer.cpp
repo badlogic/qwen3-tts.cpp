@@ -30,7 +30,7 @@ void TTSTransformer::unload_model() {
     use_coreml_code_predictor_ = false;
     coreml_code_predictor_path_.clear();
     skip_ggml_code_pred_layers_ = false;
-    use_vulkan_direct_q8_ffn_down_ = false;
+    use_direct_q8_ffn_down_ = false;
 
     if (state_.sched) {
         ggml_backend_sched_free(state_.sched);
@@ -127,10 +127,20 @@ bool TTSTransformer::load_model(const std::string & model_path) {
     }
     ggml_backend_dev_t device = ggml_backend_get_device(state_.backend);
     const char * device_name = device ? ggml_backend_dev_name(device) : "Unknown";
-    fprintf(stderr, "  TTSTransformer backend: %s\n", device_name);
-    use_vulkan_direct_q8_ffn_down_ = std::string(device_name).find("Vulkan") != std::string::npos;
-    if (use_vulkan_direct_q8_ffn_down_) {
-        fprintf(stderr, "  Vulkan direct Q8 FFN down projection enabled\n");
+    ggml_backend_reg_t backend_reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
+    const char * backend_name = ggml_backend_name(state_.backend);
+    const char * backend_reg_name = backend_reg ? ggml_backend_reg_name(backend_reg) : "Unknown";
+    fprintf(stderr, "  TTSTransformer backend: %s (%s, %s)\n", device_name, backend_name, backend_reg_name);
+    const std::string backend_type = backend_reg_name;
+    const std::string backend_device = device_name;
+    use_direct_q8_ffn_down_ = backend_type.find("Vulkan") != std::string::npos ||
+                              backend_type.find("Metal") != std::string::npos ||
+                              backend_type.find("MTL") != std::string::npos ||
+                              backend_device.find("Vulkan") != std::string::npos ||
+                              backend_device.find("Metal") != std::string::npos ||
+                              backend_device.find("MTL") != std::string::npos;
+    if (use_direct_q8_ffn_down_) {
+        fprintf(stderr, "  Direct Q8 FFN down projection enabled\n");
     }
 
     if (device && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
@@ -1831,7 +1841,7 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t n_past, 
 struct ggml_tensor * TTSTransformer::apply_ffn_down(struct ggml_context * ctx0,
                                                     const transformer_layer & layer,
                                                     struct ggml_tensor * cur) const {
-    if (use_vulkan_direct_q8_ffn_down_ && layer.ffn_down && layer.ffn_down->type == GGML_TYPE_Q8_0) {
+    if (use_direct_q8_ffn_down_ && layer.ffn_down && layer.ffn_down->type == GGML_TYPE_Q8_0) {
         return ggml_mul_mat(ctx0, layer.ffn_down, cur);
     }
 

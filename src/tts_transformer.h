@@ -346,7 +346,7 @@ private:
     bool use_coreml_code_predictor_ = false;
     std::string coreml_code_predictor_path_;
     bool skip_ggml_code_pred_layers_ = false;
-    bool use_vulkan_direct_q8_ffn_down_ = false;
+    bool use_direct_q8_ffn_down_ = false;
 
 #ifdef QWEN3_TTS_TIMING
     tts_timing * timing_ = nullptr;
