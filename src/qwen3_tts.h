@@ -78,6 +78,10 @@ struct tts_result {
 // Progress callback type
 using tts_progress_callback_t = std::function<void(int tokens_generated, int max_tokens)>;
 
+// Streaming audio callback. Receives newly decoded mono float samples (24kHz,
+// [-1,1]). Return false to cancel generation.
+using tts_audio_chunk_callback_t = std::function<bool(const float * samples, int32_t n_samples, int32_t sample_rate)>;
+
 // Main TTS class that orchestrates the full pipeline
 class Qwen3TTS {
 public:
@@ -126,6 +130,15 @@ public:
                                           const float * embedding, int32_t embedding_size,
                                           const tts_params & params = tts_params());
 
+    // Streaming synthesis with a pre-computed speaker embedding. Decodes the
+    // growing (causal) code prefix every chunk_frames frames and emits only the
+    // newly produced samples via on_audio. Cancellable by returning false.
+    tts_result synthesize_streaming_with_embedding(const std::string & text,
+                                                    const float * embedding, int32_t embedding_size,
+                                                    int32_t chunk_frames,
+                                                    const tts_audio_chunk_callback_t & on_audio,
+                                                    const tts_params & params = tts_params());
+
     // Set progress callback
     void set_progress_callback(tts_progress_callback_t callback);
     
@@ -140,6 +153,13 @@ private:
                                    const float * speaker_embedding,
                                    const tts_params & params,
                                    tts_result & result);
+
+    tts_result synthesize_streaming_internal(const std::string & text,
+                                             const float * speaker_embedding,
+                                             int32_t chunk_frames,
+                                             const tts_audio_chunk_callback_t & on_audio,
+                                             const tts_params & params,
+                                             tts_result & result);
     
     TextTokenizer tokenizer_;
     TTSTransformer transformer_;

@@ -335,6 +335,138 @@ tts_result Qwen3TTS::synthesize_with_embedding(const std::string & text,
     return synthesize_internal(text, embedding, params, result);
 }
 
+tts_result Qwen3TTS::synthesize_streaming_with_embedding(const std::string & text,
+                                                         const float * embedding, int32_t embedding_size,
+                                                         int32_t chunk_frames,
+                                                         const tts_audio_chunk_callback_t & on_audio,
+                                                         const tts_params & params) {
+    tts_result result;
+
+    if (!models_loaded_) {
+        result.error_msg = "Models not loaded";
+        return result;
+    }
+    if (embedding == nullptr || embedding_size <= 0) {
+        result.error_msg = "Invalid speaker embedding";
+        return result;
+    }
+
+    return synthesize_streaming_internal(text, embedding, chunk_frames, on_audio, params, result);
+}
+
+tts_result Qwen3TTS::synthesize_streaming_internal(const std::string & text,
+                                                   const float * speaker_embedding,
+                                                   int32_t chunk_frames,
+                                                   const tts_audio_chunk_callback_t & on_audio,
+                                                   const tts_params & params,
+                                                   tts_result & result) {
+    int64_t t_total_start = get_time_ms();
+
+    int64_t t_tokenize_start = get_time_ms();
+    std::vector<int32_t> text_tokens = tokenizer_.encode_for_tts(text);
+    result.t_tokenize_ms = get_time_ms() - t_tokenize_start;
+    if (text_tokens.empty()) {
+        result.error_msg = "Failed to tokenize text";
+        return result;
+    }
+
+    if (!transformer_loaded_) {
+        if (!transformer_.load_model(tts_model_path_)) {
+            result.error_msg = "Failed to reload TTS transformer: " + transformer_.get_error();
+            return result;
+        }
+        transformer_loaded_ = true;
+    }
+    transformer_.clear_kv_cache();
+
+    if (!decoder_loaded_) {
+        if (decoder_model_path_.empty()) {
+            result.error_msg = "Internal error: missing vocoder model path";
+            return result;
+        }
+        if (!audio_decoder_.load_model(decoder_model_path_)) {
+            result.error_msg = "Failed to load vocoder: " + audio_decoder_.get_error();
+            return result;
+        }
+        decoder_loaded_ = true;
+    }
+
+    const int n_codebooks = transformer_.get_config().n_codebooks;
+    const int sample_rate = audio_decoder_.get_config().sample_rate;
+    const int32_t chunk = chunk_frames > 0 ? chunk_frames : 1;
+
+    std::vector<int32_t> speech_codes;
+    std::vector<float> decode_buf;
+    size_t emitted_samples = 0;
+    int last_decoded_frames = 0;
+    int64_t decode_ms_accum = 0;
+    std::string decode_error;
+    bool stopped = false;
+
+    // Decode the causal prefix [0, n_frames) and emit only the newly produced tail.
+    auto emit_prefix = [&](int n_frames) -> bool {
+        if (n_frames <= 0) return true;
+        int64_t t0 = get_time_ms();
+        decode_buf.clear();
+        if (!audio_decoder_.decode(speech_codes.data(), n_frames, decode_buf)) {
+            decode_error = audio_decoder_.get_error();
+            return false;
+        }
+        decode_ms_accum += get_time_ms() - t0;
+        if (decode_buf.size() > emitted_samples) {
+            const float * new_samples = decode_buf.data() + emitted_samples;
+            int32_t n_new = (int32_t)(decode_buf.size() - emitted_samples);
+            emitted_samples = decode_buf.size();
+            if (on_audio && !on_audio(new_samples, n_new, sample_rate)) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    int64_t t_generate_start = get_time_ms();
+    auto frame_cb = [&](int n_frames_done) -> bool {
+        if (n_frames_done - last_decoded_frames < chunk) {
+            return true;
+        }
+        last_decoded_frames = n_frames_done;
+        if (!emit_prefix(n_frames_done)) {
+            stopped = true;
+            return false;
+        }
+        return true;
+    };
+
+    if (!transformer_.generate(text_tokens.data(), (int32_t)text_tokens.size(),
+                               speaker_embedding, params.max_audio_tokens, speech_codes,
+                               params.language_id, params.repetition_penalty,
+                               params.temperature, params.top_k, frame_cb)) {
+        result.error_msg = "Failed to generate speech codes: " + transformer_.get_error();
+        return result;
+    }
+    result.t_generate_ms = get_time_ms() - t_generate_start;
+
+    if (!decode_error.empty()) {
+        result.error_msg = "Failed to decode speech codes: " + decode_error;
+        return result;
+    }
+
+    const int total_frames = (int)speech_codes.size() / n_codebooks;
+    if (!stopped) {
+        // Final flush: decode the complete sequence and emit any remaining tail.
+        if (!emit_prefix(total_frames) && !decode_error.empty()) {
+            result.error_msg = "Failed to decode speech codes: " + decode_error;
+            return result;
+        }
+    }
+
+    result.t_decode_ms = decode_ms_accum;
+    result.sample_rate = sample_rate;
+    result.success = true;
+    result.t_total_ms = get_time_ms() - t_total_start;
+    return result;
+}
+
 tts_result Qwen3TTS::synthesize_internal(const std::string & text,
                                           const float * speaker_embedding,
                                           const tts_params & params,

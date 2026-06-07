@@ -2580,7 +2580,8 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
                                int32_t language_id,
                                float repetition_penalty,
                                float temperature,
-                               int32_t top_k) {
+                               int32_t top_k,
+                               const std::function<bool(int)> & on_frame) {
 #ifdef QWEN3_TTS_TIMING
     using clk = std::chrono::high_resolution_clock;
     tts_timing timing = {};
@@ -2751,6 +2752,10 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 #ifdef QWEN3_TTS_TIMING
         timing.n_frames = frame + 1;
 #endif
+
+        if (on_frame && !on_frame(frame + 1)) {
+            break;
+        }
 
         if (frame + 1 >= max_len) {
             break;
